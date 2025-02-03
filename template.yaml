@@ -1,37 +1,37 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: A simple AWS SIEM Dashboard using Amazon OpenSearch Service
+Description: >
+  SIEM Application Stack (v2):
+  This stack creates a public Amazon OpenSearch domain for SIEM logs and IOC data,
+  an S3 bucket for log archival (with a lifecycle rule to transition objects after 30 days),
+  a Kinesis Firehose delivery stream to ingest Windows logs (sent by Winlogbeat) into S3,
+  a Lambda function triggered by S3 event notifications (to be configured post-deployment) to index logs into OpenSearch,
+  a Lambda function that fetches IOC data from AlienVault OTX every hour,
+  another Lambda function that runs correlation analysis (triggered every 5 minutes) and publishes alerts via SNS,
+  and an SNS topic for SIEM alerts.
 
 Parameters:
   AllowedIPRange:
     Type: String
-    Default: 0.0.0.0/0
-    Description: "Allowed source IP range to access the OpenSearch domain (CIDR). For dev/test only."
+    Default: "0.0.0.0/0"
+    Description: "CIDR IP range allowed to access the OpenSearch domain. For production, restrict this to your IP."
+  AlienVaultAPIKey:
+    Type: String
+    NoEcho: true
+    Description: "Your AlienVault OTX API Key. Input it here."
 
 Resources:
 
-  MyVPC:
-    Type: AWS::EC2::VPC
+  ###############################
+  # 1. OpenSearch Domain (Public)
+  ###############################
+  OpenSearchServiceLinkedRole:
+    Type: AWS::IAM::ServiceLinkedRole
     Properties:
-      CidrBlock: 10.0.0.0/16
-      EnableDnsHostnames: true
-      EnableDnsSupport: true
-
-  MySubnet:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref MyVPC
-      AvailabilityZone: !Select [0, !GetAZs '']
-      CidrBlock: 10.0.1.0/24
-      MapPublicIpOnLaunch: true
-
-  OpenSearchSG:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: "SecurityGroup for OpenSearch Domain"
-      VpcId: !Ref MyVPC
+      AWSServiceName: "es.amazonaws.com"
 
   OpenSearchDomain:
     Type: AWS::OpenSearchService::Domain
+    DependsOn: OpenSearchServiceLinkedRole
     Properties:
       DomainName: "siem-dashboard"
       EngineVersion: "OpenSearch_2.5"
@@ -42,11 +42,6 @@ Resources:
       EBSOptions:
         EBSEnabled: true
         VolumeSize: 10
-      VPCOptions:
-        SubnetIds:
-          - !Ref MySubnet
-        SecurityGroupIds:
-          - !GetAtt OpenSearchSG.GroupId
       AccessPolicies:
         Version: "2012-10-17"
         Statement:
@@ -56,10 +51,320 @@ Resources:
             Resource: !Sub "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/siem-dashboard/*"
             Condition:
               IpAddress:
-                aws:SourceIp: 
+                aws:SourceIp:
                   - !Ref AllowedIPRange
 
+  ###############################
+  # 2. S3 Bucket for Log Archival
+  ###############################
+  # Removed NotificationConfiguration to break the circular dependency.
+  LogArchiveBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "siem-log-archive-${AWS::AccountId}-${AWS::Region}"
+      LifecycleConfiguration:
+        Rules:
+          - Id: "ArchiveLogsAfter30Days"
+            Status: "Enabled"
+            Prefix: ""
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+
+  #############################################
+  # 3. IAM Role for Kinesis Firehose Delivery
+  #############################################
+  FirehoseDeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "SIEM-Firehose-Delivery-Role-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: "FirehoseToS3"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !Sub "${LogArchiveBucket.Arn}"
+                  - !Sub "${LogArchiveBucket.Arn}/*"
+
+  ######################################################
+  # 4. Kinesis Firehose Delivery Stream for Windows Logs
+  ######################################################
+  LogIngestionStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: "SIEMLogStream"
+      DeliveryStreamType: DirectPut
+      S3DestinationConfiguration:
+        BucketARN: !GetAtt LogArchiveBucket.Arn
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+        BufferingHints:
+          IntervalInSeconds: 300
+          SizeInMBs: 5
+        CompressionFormat: UNCOMPRESSED
+
+  #########################################
+  # 5. SNS Topic for SIEM Alerts
+  #########################################
+  SIEMAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: "SIEMAlertsTopic"
+
+  #########################################
+  # 6. IAM Role for Lambda Functions
+  #########################################
+  SIEMLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "SIEM-Lambda-Role-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: "SIEMLambdaPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - es:ESHttpPost
+                  - es:ESHttpPut
+                  - es:ESHttpGet
+                Resource: !Sub "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/siem-dashboard/*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "arn:aws:logs:*:*:*"
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SIEMAlertsTopic
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub "${LogArchiveBucket.Arn}/*"
+                  - !Sub "${LogArchiveBucket.Arn}"
+
+  ################################################################
+  # 7. Lambda Function: Process S3 Objects -> Index Logs in OpenSearch
+  ################################################################
+  LogProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: "LogProcessorFunction"
+      Handler: "index.handler"
+      Runtime: python3.8
+      Role: !GetAtt SIEMLambdaRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          OPENSEARCH_ENDPOINT: !GetAtt OpenSearchDomain.DomainEndpoint
+      Code:
+        ZipFile: |
+          import json, boto3, urllib3, os
+          s3 = boto3.client('s3')
+          http = urllib3.PoolManager()
+
+          def handler(event, context):
+              os_endpoint = os.environ.get("OPENSEARCH_ENDPOINT")
+              for record in event.get('Records', []):
+                  bucket = record['s3']['bucket']['name']
+                  key = record['s3']['object']['key']
+                  obj = s3.get_object(Bucket=bucket, Key=key)
+                  raw_data = obj['Body'].read().decode('utf-8')
+                  try:
+                      logs = json.loads(raw_data)
+                      if isinstance(logs, dict):
+                          logs = [logs]
+                  except Exception as e:
+                      print(f"Error parsing JSON for object {key}: {e}")
+                      continue
+                  bulk_data = ""
+                  for log_entry in logs:
+                      meta = {"index": {}}
+                      bulk_data += json.dumps(meta) + "\n" + json.dumps(log_entry) + "\n"
+                  bulk_url = f"https://{os_endpoint}/logs/_bulk"
+                  response = http.request(
+                      "POST",
+                      bulk_url,
+                      body=bulk_data.encode('utf-8'),
+                      headers={"Content-Type": "application/json"}
+                  )
+                  print(response.status, response.data.decode('utf-8'))
+              return {"status": "success"}
+
+  #############################################################
+  # 8. Lambda: Ingest IOC Data from AlienVault (Hourly Trigger)
+  #############################################################
+  AlienvaultIOCIngestor:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: "AlienvaultIOCIngestor"
+      Handler: "index.handler"
+      Runtime: python3.8
+      Role: !GetAtt SIEMLambdaRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          ALIENVAULT_API_KEY: !Ref AlienVaultAPIKey
+          OPENSEARCH_ENDPOINT: !GetAtt OpenSearchDomain.DomainEndpoint
+      Code:
+        ZipFile: |
+          import json, urllib3, datetime, os
+          http = urllib3.PoolManager()
+
+          def handler(event, context):
+              api_key = os.environ.get("ALIENVAULT_API_KEY")
+              os_endpoint = os.environ.get("OPENSEARCH_ENDPOINT")
+              url = "https://otx.alienvault.com/api/v1/indicators?limit=100"
+              headers = {"X-OTX-API-KEY": api_key}
+              response = http.request("GET", url, headers=headers)
+              if response.status != 200:
+                  print("Error fetching AlienVault data:", response.status)
+                  return {"status": "error", "code": response.status}
+              data = json.loads(response.data.decode('utf-8'))
+              iocs = []
+              for indicator in data.get("results", []):
+                  iocs.append({
+                      "type": indicator.get("type", ""),
+                      "indicator": indicator.get("indicator", ""),
+                      "timestamp": datetime.datetime.utcnow().isoformat()
+                  })
+              bulk_data = ""
+              for ioc in iocs:
+                  meta = {"index": {}}
+                  bulk_data += json.dumps(meta) + "\n" + json.dumps(ioc) + "\n"
+              bulk_url = f"https://{os_endpoint}/ioc/_bulk"
+              opensearch_response = http.request(
+                  "POST",
+                  bulk_url,
+                  body=bulk_data.encode('utf-8'),
+                  headers={"Content-Type": "application/json"}
+              )
+              print("Bulk indexing response:", opensearch_response.data.decode('utf-8'))
+              return {"status": "success"}
+
+  IOCIngestionRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: "AlienvaultIOCIngestorRule"
+      ScheduleExpression: "rate(1 hour)"
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt AlienvaultIOCIngestor.Arn
+          Id: "AlienvaultIOCIngestorTarget"
+
+  IOCIngestionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AlienvaultIOCIngestor
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt IOCIngestionRule.Arn
+
+  ###########################################################
+  # 9. Lambda: Correlation Analysis Function (Every 5 Minutes)
+  ###########################################################
+  CorrelationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: "CorrelationFunction"
+      Handler: "index.handler"
+      Runtime: python3.8
+      Role: !GetAtt SIEMLambdaRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          OPENSEARCH_ENDPOINT: !GetAtt OpenSearchDomain.DomainEndpoint
+          SNS_TOPIC_ARN: !Ref SIEMAlertsTopic
+      Code:
+        ZipFile: |
+          import json, urllib3, datetime, os
+          import boto3
+          http = urllib3.PoolManager()
+          sns = boto3.client('sns')
+
+          def handler(event, context):
+              os_endpoint = os.environ.get("OPENSEARCH_ENDPOINT")
+              sns_topic = os.environ.get("SNS_TOPIC_ARN")
+              now = datetime.datetime.utcnow()
+              start_time = (now - datetime.timedelta(minutes=5)).isoformat()
+              search_url = f"https://{os_endpoint}/logs/_search"
+              query = {
+                  "query": {
+                      "range": {
+                          "@timestamp": {"gte": start_time}
+                      }
+                  }
+              }
+              response = http.request(
+                  "GET",
+                  search_url,
+                  body=json.dumps(query).encode('utf-8'),
+                  headers={"Content-Type": "application/json"}
+              )
+              results = json.loads(response.data.decode('utf-8'))
+              alerts = []
+              for hit in results.get("hits", {}).get("hits", []):
+                  log_entry = hit.get("_source", {})
+                  if log_entry.get("ioc_match", False):
+                      alerts.append(log_entry)
+              if alerts:
+                  message = f"Detected {len(alerts)} suspicious log entries."
+                  sns.publish(TopicArn=sns_topic, Message=message, Subject="SIEM Alert")
+              return {"status": "correlation run complete"}
+
+  CorrelationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: "CorrelationRule"
+      ScheduleExpression: "rate(5 minutes)"
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt CorrelationFunction.Arn
+          Id: "CorrelationFunctionTarget"
+
+  CorrelationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CorrelationFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt CorrelationRule.Arn
+
 Outputs:
+  OpenSearchDomainEndpoint:
+    Description: "Public endpoint for the OpenSearch domain"
+    Value: !GetAtt OpenSearchDomain.DomainEndpoint
   OpenSearchDashboardsURL:
-    Description: "OpenSearch Dashboards URL"
+    Description: "URL for OpenSearch Dashboards"
     Value: !Sub "https://${OpenSearchDomain.DomainEndpoint}/_dashboards"
+  FirehoseStreamName:
+    Description: "Name of the Kinesis Firehose delivery stream for logs"
+    Value: "SIEMLogStream"
+  SIEMAlertsTopicARN:
+    Description: "SNS Topic ARN for SIEM alerts"
+    Value: !Ref SIEMAlertsTopic
