@@ -1,0 +1,65 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: A simple AWS SIEM Dashboard using Amazon OpenSearch Service
+
+Parameters:
+  AllowedIPRange:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: "Allowed source IP range to access the OpenSearch domain (CIDR). For dev/test only."
+
+Resources:
+
+  MyVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+
+  MySubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+
+  OpenSearchSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "SecurityGroup for OpenSearch Domain"
+      VpcId: !Ref MyVPC
+
+  OpenSearchDomain:
+    Type: AWS::OpenSearchService::Domain
+    Properties:
+      DomainName: "siem-dashboard"
+      EngineVersion: "OpenSearch_2.5"
+      ClusterConfig:
+        InstanceType: "t3.small.search"
+        InstanceCount: 1
+        ZoneAwarenessEnabled: false
+      EBSOptions:
+        EBSEnabled: true
+        VolumeSize: 10
+      VPCOptions:
+        SubnetIds:
+          - !Ref MySubnet
+        SecurityGroupIds:
+          - !GetAtt OpenSearchSG.GroupId
+      AccessPolicies:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: "es:*"
+            Resource: !Sub "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/siem-dashboard/*"
+            Condition:
+              IpAddress:
+                aws:SourceIp: 
+                  - !Ref AllowedIPRange
+
+Outputs:
+  OpenSearchDashboardsURL:
+    Description: "OpenSearch Dashboards URL"
+    Value: !Sub "https://${OpenSearchDomain.DomainEndpoint}/_dashboards"

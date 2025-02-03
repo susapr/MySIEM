@@ -1,0 +1,18 @@
+[
+    {
+      "_id": "test-dashboard",
+      "_type": "dashboard",
+      "_source": {
+        "title": "Sample SIEM Dashboard",
+        "hits": 0,
+        "description": "A test dashboard for demonstration",
+        "panelsJSON": "[]",
+        "optionsJSON": "{\"darkTheme\":true}",
+        "timeRestore": false,
+        "kibanaSavedObjectMeta": {
+          "searchSourceJSON": "{\"query\":{\"query_string\":{\"query\":\"*\"}},\"filter\":[]}"
+        }
+      }
+    }
+  ]
+  
