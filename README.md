@@ -1,4 +1,4 @@
-# MySiem: 1-Click Deploy Cloud-Native SIEM on AWS
+# MySIEM: 1-Click Deploy Cloud-Native SIEM on AWS
 
 This repository contains a CloudFormation template and supporting code for a **cloud-native SIEM solution** built on AWS. This solution demonstrates how to ingest Windows logs and threat intelligence data, correlate events, and trigger alerts—all using AWS native services and free, open-source tools. This tool is easy to deploy, open source, and cloud-native, making it more accessible to use.
 
